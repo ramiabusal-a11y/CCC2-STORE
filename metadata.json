@@ -1,0 +1,5 @@
+{
+  "name": "متجر CCC2",
+  "description": "تطبيق متجر إلكتروني متكامل يعمل بملف واحد مع لوحة تحكم للمدير وواجهة للمتسوق. يستخدم React، Tailwind، و IndexedDB للتخزين المحلي.",
+  "requestFramePermissions": []
+}

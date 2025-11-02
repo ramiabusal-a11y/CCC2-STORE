@@ -1,0 +1,1371 @@
+
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>متجر إلكتروني متكامل</title>
+    
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- React & ReactDOM -->
+    <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+    
+    <!-- Babel Standalone (for in-browser JSX) -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+    <!-- Supabase JS Client -->
+    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+    
+    <!-- Chart.js -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    
+    <!-- Sheet.js (xlsx) -->
+    <script src="https://cdn.sheetjs.com/xlsx-latest/package/dist/xlsx.full.min.js"></script>
+
+    <style>
+        body {
+            -webkit-font-smoothing: antialiased;
+            -moz-osx-font-smoothing: grayscale;
+        }
+        .glass-card {
+            background: rgba(15, 23, 42, 0.6); /* Darker, slate-based background */
+            backdrop-filter: blur(16px);
+            -webkit-backdrop-filter: blur(16px);
+            border: 1px solid rgba(255, 255, 255, 0.1); /* More subtle border */
+        }
+        .main-bg {
+            background-color: #0f172a;
+            background-image:
+                radial-gradient(at 27% 37%, hsla(215, 98%, 61%, 1) 0px, transparent 0%),
+                radial-gradient(at 97% 21%, hsla(125, 98%, 72%, 1) 0px, transparent 50%),
+                radial-gradient(at 52% 99%, hsla(355, 98%, 76%, 1) 0px, transparent 50%),
+                radial-gradient(at 10% 29%, hsla(256, 96%, 68%, 1) 0px, transparent 50%),
+                radial-gradient(at 97% 96%, hsla(38, 60%, 74%, 1) 0px, transparent 50%),
+                radial-gradient(at 33% 50%, hsla(222, 67%, 73%, 1) 0px, transparent 50%),
+                radial-gradient(at 79% 53%, hsla(343, 68%, 79%, 1) 0px, transparent 50%);
+        }
+        .custom-scrollbar::-webkit-scrollbar {
+            width: 8px;
+        }
+        .custom-scrollbar::-webkit-scrollbar-track {
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 10px;
+        }
+        .custom-scrollbar::-webkit-scrollbar-thumb {
+            background: rgba(255, 255, 255, 0.3);
+            border-radius: 10px;
+        }
+        .custom-scrollbar::-webkit-scrollbar-thumb:hover {
+            background: rgba(255, 255, 255, 0.5);
+        }
+    </style>
+</head>
+<body class="main-bg text-white font-sans">
+    <div id="root"></div>
+
+    <script type="text/babel" data-type="module">
+        const { useState, useEffect, useRef, useCallback, useMemo } = React;
+        // Supabase client will be created on-demand from the window object.
+
+        // --- DATABASE SERVICE (IndexedDB as local cache) ---
+        const DB_NAME = 'reactSingleFileStore';
+        const DB_VERSION = 1;
+        const STORES = {
+            CATEGORIES: 'categories',
+            PRODUCTS: 'products',
+            SETTINGS: 'settings',
+        };
+
+        const indexedDBService = {
+            db: null,
+            async initDB() {
+                return new Promise((resolve, reject) => {
+                    if (this.db) return resolve(this.db);
+                    const request = indexedDB.open(DB_NAME, DB_VERSION);
+                    request.onerror = (event) => reject("Database error: " + event.target.error);
+                    request.onupgradeneeded = (event) => {
+                        const db = event.target.result;
+                        Object.values(STORES).forEach(storeName => {
+                            if (!db.objectStoreNames.contains(storeName)) {
+                                db.createObjectStore(storeName, { keyPath: 'id' });
+                            }
+                        });
+                    };
+                    request.onsuccess = (event) => {
+                        this.db = event.target.result;
+                        resolve(this.db);
+                    };
+                });
+            },
+            async performOperation(storeName, mode, operation) {
+                const db = await this.initDB();
+                const transaction = db.transaction(storeName, mode);
+                const store = transaction.objectStore(storeName);
+                return new Promise((resolve, reject) => {
+                    operation(store, resolve, reject);
+                    transaction.oncomplete = () => {};
+                    transaction.onerror = (event) => reject(event.target.error);
+                });
+            },
+            async getAll(storeName) {
+                return this.performOperation(storeName, 'readonly', (store, resolve) => store.getAll().onsuccess = e => resolve(e.target.result));
+            },
+            async add(storeName, item) {
+                // In IndexedDB, put works for both add and update.
+                return this.performOperation(storeName, 'readwrite', (store, resolve) => store.put(item).onsuccess = e => resolve(e.target.result));
+            },
+            async put(storeName, item) {
+                return this.performOperation(storeName, 'readwrite', (store, resolve) => store.put(item).onsuccess = e => resolve(e.target.result));
+            },
+            async delete(storeName, id) {
+                return this.performOperation(storeName, 'readwrite', (store, resolve) => store.delete(id).onsuccess = () => resolve(true));
+            },
+            async clearAllData() {
+                const db = await this.initDB();
+                return new Promise((resolve, reject) => {
+                    const transaction = db.transaction(Object.values(STORES), 'readwrite');
+                    transaction.onerror = event => reject(event.target.error);
+                    transaction.oncomplete = () => resolve(true);
+                    Object.values(STORES).forEach(storeName => transaction.objectStore(storeName).clear());
+                });
+            },
+        };
+
+        // --- UNIFIED DATA SERVICE (Supabase + IndexedDB Cache) ---
+        const dataService = {
+            supabase: null,
+
+            init(supabaseClient) {
+                this.supabase = supabaseClient;
+            },
+
+            async syncAllDataFromSupabase() {
+                if (!this.supabase) return null;
+                try {
+                    console.log("Starting sync from Supabase...");
+                    const [categoriesRes, productsRes, settingsRes] = await Promise.all([
+                        this.supabase.from('categories').select('*'),
+                        this.supabase.from('products').select('*'),
+                        this.supabase.from('settings').select('*')
+                    ]);
+                    
+                    if (categoriesRes.error) throw categoriesRes.error;
+                    if (productsRes.error) throw productsRes.error;
+                    if (settingsRes.error) throw settingsRes.error;
+
+                    await indexedDBService.clearAllData();
+
+                    for (const item of categoriesRes.data) await indexedDBService.add(STORES.CATEGORIES, item);
+                    for (const item of productsRes.data) await indexedDBService.add(STORES.PRODUCTS, item);
+                    // For settings, transform from array to key-value object for easier caching/access
+                    const settingsMap = settingsRes.data.reduce((acc, setting) => {
+                        acc[setting.key] = setting;
+                        return acc;
+                    }, {});
+                    await indexedDBService.add(STORES.SETTINGS, { id: 'all_settings', data: settingsMap });
+
+                    console.log("Sync complete.");
+                    return { 
+                        categories: categoriesRes.data, 
+                        products: productsRes.data, 
+                        settings: settingsMap 
+                    };
+                } catch (error) {
+                    console.error("Error syncing data from Supabase:", error.message);
+                    // If sync fails, try to load from local cache as a fallback
+                    return this.getAllLocalData();
+                }
+            },
+            
+            async getAllLocalData() {
+                 console.log("Loading data from local cache...");
+                 const [categories, products, settingsContainer] = await Promise.all([
+                    indexedDBService.getAll(STORES.CATEGORIES),
+                    indexedDBService.getAll(STORES.PRODUCTS),
+                    indexedDBService.getAll(STORES.SETTINGS)
+                 ]);
+                 const settings = settingsContainer.length > 0 ? settingsContainer[0].data : {};
+                 return { categories, products, settings };
+            },
+            
+            // --- CUD Operations (Create, Update, Delete) ---
+            async add(storeName, item) {
+                const { data, error } = await this.supabase.from(storeName).insert(item).select();
+                if (error) throw error;
+                const newItem = data[0];
+                await indexedDBService.add(storeName, newItem);
+                return newItem;
+            },
+
+            async put(storeName, item) {
+                 const { id, ...updateData } = item;
+                 const { data, error } = await this.supabase.from(storeName).update(updateData).eq('id', id).select();
+                 if (error) throw error;
+                 const updatedItem = data[0];
+                 await indexedDBService.put(storeName, updatedItem);
+                 return updatedItem;
+            },
+
+            async delete(storeName, id) {
+                 const { error } = await this.supabase.from(storeName).delete().eq('id', id);
+                 if (error) throw error;
+                 await indexedDBService.delete(storeName, id);
+                 return true;
+            },
+
+            // --- Settings Specific ---
+            async getSetting(key) {
+                const settingsContainer = await indexedDBService.getAll(STORES.SETTINGS);
+                return settingsContainer.length > 0 ? settingsContainer[0].data[key]?.value : null;
+            },
+            
+            async setSetting(key, value) {
+                const { data, error } = await this.supabase
+                    .from('settings')
+                    .upsert({ key: key, value: value }, { onConflict: 'user_id, key' })
+                    .select();
+                if (error) throw error;
+                // Full settings resync to update local cache correctly
+                await this.syncAllDataFromSupabase();
+                return data[0];
+            }
+        };
+
+
+        // --- HELPER FUNCTIONS ---
+        const fileToBase64 = (file) => new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.readAsDataURL(file);
+            reader.onload = () => resolve(reader.result);
+            reader.onerror = error => reject(error);
+        });
+
+        // --- SVG ICONS (kept as is) ---
+        const ICONS = {
+            dashboard: <path strokeLinecap="round" strokeLinejoin="round" d="M3.75 3v11.25A2.25 2.25 0 006 16.5h2.25M3.75 3h-1.5m1.5 0h16.5m0 0h1.5m-1.5 0v11.25A2.25 2.25 0 0118 16.5h-2.25m-7.5 0h7.5m-7.5 0l-1 1.5m1-1.5l1 1.5m0 0l.5 1.5m-.5-1.5h-9.5m0 0l-.5 1.5m.75-1.5l.5-1.5m0 0l.5 1.5m-3-1.5l.5-1.5m2.5-3l-1.5-1.5m0 0l-1.5 1.5m1.5-1.5V3.75" />,
+            categories: <path strokeLinecap="round" strokeLinejoin="round" d="M3.75 6A2.25 2.25 0 016 3.75h2.25A2.25 2.25 0 0110.5 6v2.25a2.25 2.25 0 01-2.25 2.25H6a2.25 2.25 0 01-2.25-2.25V6zM3.75 15.75A2.25 2.25 0 016 13.5h2.25a2.25 2.25 0 012.25 2.25V18a2.25 2.25 0 01-2.25 2.25H6A2.25 2.25 0 013.75 18v-2.25zM13.5 6a2.25 2.25 0 012.25-2.25H18A2.25 2.25 0 0120.25 6v2.25A2.25 2.25 0 0118 10.5h-2.25a2.25 2.25 0 01-2.25-2.25V6zM13.5 15.75a2.25 2.25 0 012.25-2.25H18a2.25 2.25 0 012.25 2.25V18A2.25 2.25 0 0118 20.25h-2.25A2.25 2.25 0 0113.5 18v-2.25z" />,
+            products: <path strokeLinecap="round" strokeLinejoin="round" d="M2.25 3h1.386c.51 0 .955.343 1.087.835l.383 1.437M7.5 14.25a3 3 0 00-3 3h15.75m-12.75-3h11.218c.51 0 .962-.343 1.087-.835l.383-1.437M7.5 14.25L5.106 5.106A2.25 2.25 0 002.869 3H2.25m0 0L3.06 16.5m0 0a2.25 2.25 0 002.25 2.25h10.5a2.25 2.25 0 002.25-2.25m-15-13.5h15" />,
+            settings: <path strokeLinecap="round" strokeLinejoin="round" d="M10.343 3.94c.09-.542.56-1.025 1.11-1.11a12.004 12.004 0 014.093 0c.55.085 1.02.568 1.11 1.11.09.542.09 1.097 0 1.639-.09.542-.56 1.025-1.11 1.11a12.004 12.004 0 01-4.093 0c-.55-.085-1.02-.568-1.11-1.11a12.007 12.007 0 010-1.639zM10.343 3.94a12.004 12.004 0 00-4.093 0c-.55.085-1.02.568-1.11 1.11a12.007 12.007 0 000 1.639c.09.542.56 1.025 1.11 1.11a12.004 12.004 0 004.093 0c.55-.085-1.02-.568-1.11-1.11a12.007 12.007 0 000-1.639zM10.343 3.94L9 2.25m1.343 1.69l1.5-1.5m-1.5 1.5l-1.5-1.5m3 3l1.5 1.5m-1.5-1.5l1.5-1.5m0 0l1.5 1.5m-1.5-1.5l-1.5 1.5m-1.5-1.5l-1.5 1.5m7.5 6l-1.5-1.5m0 0l-1.5 1.5m1.5-1.5V12m0 3.75l1.5-1.5m-1.5 1.5l-1.5 1.5m-1.5-1.5l1.5-1.5m3 3l-1.5 1.5m0 0l-1.5-1.5m1.5-1.5V12m0 3.75l-1.5 1.5m1.5-1.5l1.5 1.5m-1.5-1.5l-1.5 1.5m-1.5-1.5l-1.5-1.5M9 12l1.5 1.5 1.5-1.5m-3 0l-1.5 1.5 1.5 1.5m0-3l1.5-1.5 1.5 1.5m-3 0l-1.5-1.5-1.5 1.5m9 3.75l1.5-1.5m-1.5 1.5l1.5 1.5" />,
+            plus: <path strokeLinecap="round" strokeLinejoin="round" d="M12 4.5v15m7.5-7.5h-15" />,
+            edit: <path strokeLinecap="round" strokeLinejoin="round" d="M16.862 4.487l1.687-1.688a1.875 1.875 0 112.652 2.652L6.832 19.82a4.5 4.5 0 01-1.897 1.13l-2.685.8.8-2.685a4.5 4.5 0 011.13-1.897L16.863 4.487zm0 0L19.5 7.125" />,
+            trash: <path strokeLinecap="round" strokeLinejoin="round" d="M14.74 9l-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 01-2.244 2.077H8.084a2.25 2.25 0 01-2.244-2.077L4.772 5.79m14.456 0a48.108 48.108 0 00-3.478-.397m-12 .562c.34-.059.68-.114 1.022-.165m0 0a48.11 48.11 0 013.478-.397m7.5 0v-.916c0-1.18-.91-2.164-2.09-2.201a51.964 51.964 0 00-3.32 0c-1.18.037-2.09 1.022-2.09 2.201v.916m7.5 0a48.667 48.667 0 00-7.5 0" />,
+            upload: <path strokeLinecap="round" strokeLinejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5m-13.5-9L12 3m0 0l4.5 4.5M12 3v13.5" />,
+            close: <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />,
+            cart: <path strokeLinecap="round" strokeLinejoin="round" d="M2.25 3h1.386c.51 0 .955.343 1.087.835l.383 1.437M7.5 14.25a3 3 0 00-3 3h15.75m-12.75-3h11.218c.51 0 .962-.343 1.087-.835l.383-1.437M7.5 14.25L5.106 5.106A2.25 2.25 0 002.869 3H2.25" />,
+            whatsapp: <path d="M16.6 14.2c-.2-.1-1.5-.7-1.7-.8-.2-.1-.4-.1-.6.1-.2.2-.6.7-.8.9-.1.1-.3.2-.5.1-.2-.1-.9-.3-1.8-1.1-.7-.6-1.1-1.4-1.3-1.6-.1-.2 0-.4.1-.5.1-.1.2-.2.4-.4.1-.1.2-.2.2-.4.1-.1.1-.3 0-.4-.1-.1-.6-1.4-.8-1.9-.2-.5-.4-.4-.5-.4h-.5c-.2 0-.4.1-.6.3-.2.2-.8.8-.8 1.9s.8 2.2 1 2.3c.1.1 1.5.7 1.7.8.2.1.9.3 1.8 1.1.7.6 1.1 1.4 1.3 1.6.1.2 0 .4-.1.5-.1.1-.2.2-.4.4-.1.1-.2.2-.2.4.1-.1.1-.3 0-.4-.1-.1-.6-1.4-.8-1.9C12.9 5.8 12.7 5.7 12.5 5.7h-.5c-.2 0-.4.1-.6.3-.2.2-.8.8-.8 1.9s.8 2.2 1 2.3c.1.1 1.5 2.4 3.7 3.3.5.2.9.4 1.2.5.5.2 1 .1 1.3-.1.4-.2 1.2-1.4 1.4-1.8.2-.4.2-.8.1-.9l-.4-.2z" />,
+            back: <path strokeLinecap="round" strokeLinejoin="round" d="M9 15L3 9m0 0l6-6M3 9h12a6 6 0 010 12h-3" />,
+            manager: <path strokeLinecap="round" strokeLinejoin="round" d="M18 18.72a9.094 9.094 0 003.741-.479 3 3 0 00-4.682-2.72m-7.5-2.226c0 1.617.64 3.14 1.682 4.243a9.09 9.09 0 01-4.243-1.682A3 3 0 0118 15.372M6.082 6.082A9.09 9.09 0 0110.5 3.5c2.286 0 4.402.873 6.004 2.348m-5.434 2.053a3.003 3.003 0 014.242 0 3 3 0 010 4.242 3 3 0 01-4.242 0 3 3 0 010-4.242zM12 12a2.25 2.25 0 100-4.5 2.25 2.25 0 000 4.5z" />,
+            shopper: <path strokeLinecap="round" strokeLinejoin="round" d="M15.75 10.5V6a3.75 3.75 0 10-7.5 0v4.5m11.356-1.993l1.263 12c.07.658-.463 1.243-1.119 1.243H4.25a1.125 1.125 0 01-1.12-1.243l1.264-12A1.125 1.125 0 015.513 7.5h9.974c.576 0 1.059.435 1.119 1.007zM8.625 10.5a.375.375 0 11-.75 0 .375.375 0 01.75 0zm7.5 0a.375.375 0 11-.75 0 .375.375 0 01.75 0z" />,
+            store: <path strokeLinecap="round" strokeLinejoin="round" d="M13.5 21v-7.5A2.25 2.25 0 0011.25 11.25H6.75A2.25 2.25 0 004.5 13.5V21M6.75 21v-7.5A2.25 2.25 0 019 11.25h1.5A2.25 2.25 0 0112.75 13.5V21m-4.5 0h6.75m-11.25 0h15.75m-15.75 0L4.5 18m11.25 0l1.5 3M4.5 18l1.5-3m11.25 0l-1.5-3m-6.75 0h1.5m-1.5 0l-1.5 3m1.5-3l1.5 3m0 0l-1.5 3m1.5-3l1.5-3M3.75 6.75h16.5M3.75 6.75c0-1.24 1.01-2.25 2.25-2.25h12c1.24 0 2.25 1.01 2.25 2.25m-16.5 0v.25c0 .621.504 1.125 1.125 1.125h14.25c.621 0 1.125-.504 1.125-1.125V6.75" />,
+            lock: <path strokeLinecap="round" strokeLinejoin="round" d="M16.5 10.5V6.75a4.5 4.5 0 10-9 0v3.75m-.75 11.25h10.5a2.25 2.25 0 002.25-2.25v-6.75a2.25 2.25 0 00-2.25-2.25H6.75a2.25 2.25 0 00-2.25 2.25v6.75a2.25 2.25 0 002.25 2.25z" />,
+            menu: <path strokeLinecap="round" strokeLinejoin="round" d="M3.75 6.75h16.5M3.75 12h16.5m-16.5 5.25h16.5" />,
+            logout: <path strokeLinecap="round" strokeLinejoin="round" d="M15.75 9V5.25A2.25 2.25 0 0013.5 3h-6a2.25 2.25 0 00-2.25 2.25v13.5A2.25 2.25 0 007.5 21h6a2.25 2.25 0 002.25-2.25V15m3 0l3-3m0 0l-3-3m3 3H9" />,
+            database: <path strokeLinecap="round" strokeLinejoin="round" d="M3.75 21h16.5M4.5 3h15M5.25 3v18m13.5-18v18M9 6.75h6.375a.375.375 0 01.375.375v1.5a.375.375 0 01-.375.375H9a.375.375 0 01-.375-.375v-1.5A.375.375 0 019 6.75zM9 12.75h6.375a.375.375 0 01.375.375v1.5a.375.375 0 01-.375.375H9a.375.375 0 01-.375-.375v-1.5A.375.375 0 019 12.75z" />
+        };
+        
+        // --- UI COMPONENTS ---
+        const Icon = ({ path, className = "w-6 h-6" }) => (
+            <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" className={className}>
+                {path}
+            </svg>
+        );
+
+        const Button = ({ children, onClick, className = '', variant = 'primary', type = 'button', disabled = false }) => {
+            const baseClasses = 'px-4 py-2 rounded-lg font-semibold shadow-md transition-all duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-slate-900 flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed';
+            const variants = {
+                primary: 'bg-sky-500 hover:bg-sky-600 text-white focus:ring-sky-500',
+                secondary: 'bg-slate-600 hover:bg-slate-700 text-white focus:ring-slate-500',
+                danger: 'bg-red-600 hover:bg-red-700 text-white focus:ring-red-500',
+                ghost: 'bg-transparent hover:bg-white/10 text-white',
+            };
+            return (
+                <button type={type} onClick={onClick} className={`${baseClasses} ${variants[variant]} ${className}`} disabled={disabled}>
+                    {children}
+                </button>
+            );
+        };
+        
+        const Spinner = ({ size = '8' }) => (
+             <div className={`animate-spin rounded-full h-${size} w-${size} border-b-2 border-white`}></div>
+        );
+        
+        const FullScreenSpinner = ({ message }) => (
+            <div className="min-h-screen flex flex-col justify-center items-center">
+                <Spinner size="12" />
+                {message && <p className="mt-4 text-lg">{message}</p>}
+            </div>
+        );
+
+        const Toast = ({ message, show, onDismiss }) => {
+          useEffect(() => {
+            if (show) {
+              const timer = setTimeout(onDismiss, 3000);
+              return () => clearTimeout(timer);
+            }
+          }, [show, onDismiss]);
+
+          return (
+            <div className={`fixed bottom-5 left-1/2 -translate-x-1/2 transform transition-all duration-300 ${show ? 'opacity-100 translate-y-0' : 'opacity-0 translate-y-5'}`}>
+              <div className="glass-card text-white font-semibold px-6 py-3 rounded-full shadow-lg">
+                {message}
+              </div>
+            </div>
+          );
+        };
+
+        const Modal = ({ isOpen, onClose, title, children }) => {
+            if (!isOpen) return null;
+            return (
+                <div className="fixed inset-0 bg-black bg-opacity-70 backdrop-blur-sm flex justify-center items-center z-50" onClick={onClose}>
+                    <div className="glass-card w-full max-w-2xl rounded-2xl shadow-2xl p-6 text-white m-4" onClick={e => e.stopPropagation()}>
+                        <div className="flex justify-between items-center border-b border-white/20 pb-4 mb-4">
+                            <h3 className="text-2xl font-bold">{title}</h3>
+                            <button onClick={onClose} className="p-1 rounded-full hover:bg-white/10 transition-colors">
+                                <Icon path={ICONS.close} className="w-7 h-7" />
+                            </button>
+                        </div>
+                        <div className="max-h-[70vh] overflow-y-auto custom-scrollbar pr-2">
+                           {children}
+                        </div>
+                    </div>
+                </div>
+            );
+        };
+        
+        // --- AUTH & SETUP COMPONENTS ---
+
+        const SupabaseSetupScreen = ({ onSave }) => {
+            const [url, setUrl] = useState('');
+            const [anonKey, setAnonKey] = useState('');
+            const [isLoading, setIsLoading] = useState(false);
+            const [error, setError] = useState('');
+
+            const handleSubmit = async (e) => {
+                e.preventDefault();
+                setIsLoading(true);
+                setError('');
+                const finalUrl = url.trim();
+                const finalAnonKey = anonKey.trim();
+
+                try {
+                    if (typeof supabase?.createClient !== 'function') {
+                        throw new Error("مكتبة Supabase لم يتم تحميلها. يرجى التحقق من اتصالك بالإنترنت.");
+                    }
+                    if (!finalUrl || !finalAnonKey) {
+                        throw new Error("يرجى إدخال الرابط والمفتاح.");
+                    }
+                    const testClient = supabase.createClient(finalUrl, finalAnonKey);
+                    
+                    const { error: testError } = await testClient.from('settings').select('key', { head: true });
+
+                    if (testError) {
+                        throw testError; // Throw the detailed Supabase error
+                    }
+
+                    console.log("Supabase connection and table access test successful.");
+                    onSave({ url: finalUrl, anonKey: finalAnonKey });
+                } catch (err) {
+                    let errorMessage = 'فشل الاتصال. الرجاء التحقق من الرابط والمفتاح.';
+                    if (err.message) {
+                        const lowerMsg = err.message.toLowerCase();
+                        if (lowerMsg.includes('fetch')) {
+                            errorMessage = 'فشل الاتصال بالرابط. تأكد من صحة الرابط ووجود اتصال بالإنترنت.';
+                        } else if (lowerMsg.includes('jwt')) {
+                            errorMessage = 'مفتاح Supabase (Anon Key) غير صالح.';
+                        } else if (lowerMsg.includes('relation "settings" does not exist')) {
+                            errorMessage = 'تم الاتصال بنجاح، لكن جدول الإعدادات (settings) غير موجود. يرجى التأكد من تشغيل SQL لإنشاء الجداول.';
+                        } else if (lowerMsg.includes('permission denied')) {
+                             errorMessage = 'تم الاتصال بنجاح، لكن تم رفض الوصول للبيانات. يرجى مراجعة سياسات أمان الوصول (RLS) في Supabase.';
+                        } else {
+                            errorMessage = err.message; // Use the more specific error from the catch
+                        }
+                    }
+                    setError(errorMessage);
+                    console.error("Supabase connection test failed:", err);
+                } finally {
+                    setIsLoading(false);
+                }
+            };
+            
+            return (
+                <div className="min-h-screen flex justify-center items-center p-4">
+                    <div className="glass-card w-full max-w-md rounded-2xl shadow-2xl p-8 text-white">
+                        <div className="text-center mb-6">
+                            <Icon path={ICONS.database} className="w-16 h-16 mx-auto text-sky-400" />
+                            <h2 className="text-3xl font-bold mt-4">إعداد الاتصال بقاعدة البيانات</h2>
+                            <p className="text-slate-300 mt-2">
+                                يرجى إدخال بيانات مشروع Supabase الخاص بك. ستظهر هذه الشاشة مرة واحدة فقط.
+                            </p>
+                        </div>
+                        <form onSubmit={handleSubmit} className="space-y-4">
+                            <div>
+                                <label htmlFor="supabase-url" className="block text-sm font-medium text-slate-300 mb-1">Supabase URL</label>
+                                <input id="supabase-url" type="url" value={url} onChange={e => setUrl(e.target.value)} required placeholder="https://<project-id>.supabase.co" className="w-full bg-white/10 border text-left dir-ltr border-white/20 rounded-lg px-3 py-2 text-white focus:outline-none focus:ring-2 focus:ring-sky-500" />
+                            </div>
+                             <div>
+                                <label htmlFor="supabase-key" className="block text-sm font-medium text-slate-300 mb-1">Supabase Anon (Public) Key</label>
+                                <textarea id="supabase-key" value={anonKey} onChange={e => setAnonKey(e.target.value)} required rows="3" placeholder="eyJhbGciOiJI..." className="w-full bg-white/10 border text-left dir-ltr border-white/20 rounded-lg px-3 py-2 text-white focus:outline-none focus:ring-2 focus:ring-sky-500"></textarea>
+                            </div>
+                            {error && <p className="text-red-400 text-sm text-center">{error}</p>}
+                            <Button type="submit" variant="primary" className="w-full" disabled={isLoading}>
+                                {isLoading ? <Spinner size="5" /> : 'حفظ واختبار الاتصال'}
+                            </Button>
+                        </form>
+                    </div>
+                </div>
+            );
+        };
+
+        const LoginScreen = () => {
+            const [email, setEmail] = useState('');
+            const [password, setPassword] = useState('');
+            const [isLoginView, setIsLoginView] = useState(true);
+            const [isLoading, setIsLoading] = useState(false);
+            const [error, setError] = useState('');
+            const [message, setMessage] = useState('');
+
+            const handleAuth = async (e) => {
+                e.preventDefault();
+                setIsLoading(true);
+                setError('');
+                setMessage('');
+                try {
+                    if (isLoginView) {
+                        const { error } = await dataService.supabase.auth.signInWithPassword({ email, password });
+                        if (error) throw error;
+                    } else {
+                        const { error } = await dataService.supabase.auth.signUp({ email, password });
+                        if (error) throw error;
+                        setMessage('تم إنشاء الحساب بنجاح! يرجى التحقق من بريدك الإلكتروني لتفعيل الحساب.');
+                    }
+                } catch (err) {
+                    setError(err.message || 'حدث خطأ ما.');
+                } finally {
+                    setIsLoading(false);
+                }
+            };
+            
+            return (
+                 <div className="min-h-screen flex justify-center items-center p-4">
+                    <div className="glass-card w-full max-w-sm rounded-2xl shadow-2xl p-8 text-white">
+                        <div className="text-center mb-6">
+                            <Icon path={ICONS.lock} className="w-12 h-12 mx-auto text-sky-400" />
+                            <h2 className="text-3xl font-bold mt-4">{isLoginView ? 'تسجيل الدخول' : 'إنشاء حساب مدير'}</h2>
+                        </div>
+                        <form onSubmit={handleAuth} className="space-y-4">
+                            <div>
+                                <label className="block text-sm font-medium text-slate-300 mb-1">البريد الإلكتروني</label>
+                                <input type="email" value={email} onChange={e => setEmail(e.target.value)} required className="w-full bg-white/10 border text-left dir-ltr border-white/20 rounded-lg px-3 py-2 text-white focus:outline-none focus:ring-2 focus:ring-sky-500" />
+                            </div>
+                            <div>
+                                <label className="block text-sm font-medium text-slate-300 mb-1">كلمة المرور</label>
+                                <input type="password" value={password} onChange={e => setPassword(e.target.value)} required className="w-full bg-white/10 border text-left dir-ltr border-white/20 rounded-lg px-3 py-2 text-white focus:outline-none focus:ring-2 focus:ring-sky-500" />
+                            </div>
+
+                            {error && <p className="text-red-400 text-sm text-center">{error}</p>}
+                            {message && <p className="text-green-400 text-sm text-center">{message}</p>}
+
+                            <Button type="submit" variant="primary" className="w-full" disabled={isLoading}>
+                                {isLoading ? <Spinner size="5" /> : (isLoginView ? 'دخول' : 'إنشاء حساب')}
+                            </Button>
+                        </form>
+                        <div className="text-center mt-4">
+                            <button onClick={() => setIsLoginView(!isLoginView)} className="text-sm text-sky-400 hover:underline">
+                                {isLoginView ? 'ليس لديك حساب؟ إنشاء حساب مدير جديد' : 'لديك حساب بالفعل؟ تسجيل الدخول'}
+                            </button>
+                        </div>
+                    </div>
+                 </div>
+            );
+        };
+
+        // --- ADMIN COMPONENTS ---
+
+        const ChartComponent = ({ data, type, options, title }) => {
+            const chartRef = useRef(null);
+            const chartInstance = useRef(null);
+
+            useEffect(() => {
+                if (chartRef.current) {
+                    if (chartInstance.current) chartInstance.current.destroy();
+                    const ctx = chartRef.current.getContext('2d');
+                    chartInstance.current = new Chart(ctx, { type, data, options: {
+                        responsive: true, maintainAspectRatio: false,
+                        plugins: { legend: { labels: { color: 'white', font: { size: 14 } } },
+                        title: { display: true, text: title, color: 'white', font: { size: 18, weight: 'bold' } } },
+                        scales: { y: { beginAtZero: true, ticks: { color: 'white' }, grid: { color: 'rgba(255, 255, 255, 0.2)' } },
+                        x: { ticks: { color: 'white' }, grid: { color: 'rgba(255, 255, 255, 0.1)' } } }
+                    }});
+                }
+                return () => { if (chartInstance.current) chartInstance.current.destroy(); };
+            }, [data, type, options, title]);
+
+            return <canvas ref={chartRef} />;
+        };
+
+        const StatCard = ({ title, value, icon }) => (
+            <div className="glass-card p-6 rounded-xl flex items-center justify-between">
+                <div>
+                    <p className="text-slate-300 text-lg">{title}</p>
+                    <p className="text-4xl font-bold">{value}</p>
+                </div>
+                <div className="text-sky-400">
+                   <Icon path={icon} className="w-12 h-12" />
+                </div>
+            </div>
+        );
+
+        const DashboardTab = ({ categories, products }) => {
+            const chartData = {
+                labels: categories.map(c => c.name),
+                datasets: [{
+                    label: 'عدد المنتجات في كل قسم',
+                    data: categories.map(c => products.filter(p => p.category_id === c.id).length),
+                    backgroundColor: ['rgba(59, 130, 246, 0.7)', 'rgba(239, 68, 68, 0.7)', 'rgba(16, 185, 129, 0.7)', 'rgba(249, 115, 22, 0.7)', 'rgba(139, 92, 246, 0.7)', 'rgba(236, 72, 153, 0.7)'],
+                    borderColor: ['rgba(59, 130, 246, 1)', 'rgba(239, 68, 68, 1)', 'rgba(16, 185, 129, 1)', 'rgba(249, 115, 22, 1)', 'rgba(139, 92, 246, 1)', 'rgba(236, 72, 153, 1)'],
+                    borderWidth: 1
+                }]
+            };
+
+            return (
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                    <StatCard title="الأقسام" value={categories.length} icon={ICONS.categories} />
+                    <StatCard title="المنتجات" value={products.length} icon={ICONS.products} />
+                    <StatCard title="إجمالي الطلبات" value={0} icon={ICONS.cart} />
+                    <div className="md:col-span-3 glass-card p-6 rounded-xl h-96">
+                        <ChartComponent data={chartData} type="bar" title="توزيع المنتجات على الأقسام" />
+                    </div>
+                </div>
+            );
+        };
+        
+        const CategoryForm = ({ onSubmit, category, onDone }) => {
+            const [name, setName] = useState(category ? category.name : '');
+            const [image, setImage] = useState(category ? category.image : null);
+
+            const handleSubmit = async (e) => {
+                e.preventDefault();
+                let imageData = image;
+                const fileInput = e.target.elements.imageFile;
+                if (fileInput.files && fileInput.files[0]) {
+                    imageData = await fileToBase64(fileInput.files[0]);
+                }
+                if (!name || !imageData) {
+                    alert('الرجاء إدخال اسم القسم ورفع صورة.');
+                    return;
+                }
+                onSubmit({ ...category, name, image: imageData });
+            };
+
+            return (
+                <form onSubmit={handleSubmit} className="space-y-4">
+                    <div>
+                        <label htmlFor="name" className="block text-sm font-medium text-slate-300 mb-1">اسم القسم</label>
+                        <input type="text" id="name" value={name} onChange={e => setName(e.target.value)}
+                            className="w-full bg-white/10 border border-white/20 rounded-lg px-3 py-2 text-white focus:outline-none focus:ring-2 focus:ring-sky-500" required />
+                    </div>
+                     <div>
+                        <label htmlFor="imageFile" className="block text-sm font-medium text-slate-300 mb-1">صورة القسم</label>
+                        <input type="file" id="imageFile" accept="image/*"
+                            className="w-full text-sm text-slate-400 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-sky-50 file:text-sky-700 hover:file:bg-sky-100" />
+                        {image && <img src={image} alt="Preview" className="mt-4 h-24 w-24 object-cover rounded-lg" />}
+                    </div>
+                    <div className="flex justify-end gap-4 pt-4">
+                        <Button onClick={onDone} variant="secondary">إلغاء</Button>
+                        <Button type="submit" variant="primary">
+                            {category ? 'تحديث القسم' : 'إضافة قسم'}
+                        </Button>
+                    </div>
+                </form>
+            );
+        };
+
+        const CategoriesTab = ({ categories, setCategories, showToast }) => {
+            const [isModalOpen, setIsModalOpen] = useState(false);
+            const [editingCategory, setEditingCategory] = useState(null);
+
+            const handleAddClick = () => {
+                setEditingCategory(null);
+                setIsModalOpen(true);
+            };
+
+            const handleEditClick = (category) => {
+                setEditingCategory(category);
+                setIsModalOpen(true);
+            };
+
+            const handleDelete = async (id) => {
+                if (window.confirm('هل أنت متأكد من حذف هذا القسم؟ سيتم حذف جميع المنتجات المرتبطة به.')) {
+                    try {
+                        await dataService.delete(STORES.CATEGORIES, id);
+                        setCategories(categories.filter(c => c.id !== id));
+                        showToast('تم حذف القسم بنجاح');
+                    } catch (error) {
+                        showToast('خطأ: ' + error.message);
+                    }
+                }
+            };
+
+            const handleSubmit = async (categoryData) => {
+                try {
+                    if (editingCategory) {
+                        const updated = await dataService.put(STORES.CATEGORIES, categoryData);
+                        setCategories(categories.map(c => c.id === updated.id ? updated : c));
+                        showToast('تم تحديث القسم بنجاح');
+                    } else {
+                        const { id, ...newData } = categoryData;
+                        const added = await dataService.add(STORES.CATEGORIES, newData);
+                        setCategories([...categories, added]);
+                        showToast('تمت إضافة القسم بنجاح');
+                    }
+                    setIsModalOpen(false);
+                } catch (error) {
+                    showToast('خطأ: ' + error.message);
+                }
+            };
+
+            return (
+                <div>
+                    <div className="flex justify-between items-center mb-6">
+                        <h2 className="text-2xl font-bold">إدارة الأقسام</h2>
+                        <Button onClick={handleAddClick}>
+                            <Icon path={ICONS.plus} />
+                            إضافة قسم جديد
+                        </Button>
+                    </div>
+                    <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-6">
+                        {categories.map(cat => (
+                            <div key={cat.id} className="glass-card rounded-lg overflow-hidden group relative">
+                                <img src={cat.image} alt={cat.name} className="w-full h-40 object-cover" />
+                                <div className="p-4">
+                                    <h3 className="font-bold text-lg">{cat.name}</h3>
+                                </div>
+                                <div className="absolute inset-0 bg-black/60 flex items-center justify-center gap-4 opacity-0 group-hover:opacity-100 transition-opacity duration-300">
+                                    <Button onClick={() => handleEditClick(cat)} variant="secondary"><Icon path={ICONS.edit} /></Button>
+                                    <Button onClick={() => handleDelete(cat.id)} variant="danger"><Icon path={ICONS.trash} /></Button>
+                                </div>
+                            </div>
+                        ))}
+                    </div>
+                    <Modal isOpen={isModalOpen} onClose={() => setIsModalOpen(false)} title={editingCategory ? 'تعديل القسم' : 'إضافة قسم جديد'}>
+                        <CategoryForm onSubmit={handleSubmit} category={editingCategory} onDone={() => setIsModalOpen(false)} />
+                    </Modal>
+                </div>
+            );
+        };
+        
+        const ProductForm = ({ onSubmit, product, categories, onDone }) => {
+            const [name, setName] = useState(product ? product.name : '');
+            const [price, setPrice] = useState(product ? product.price : '');
+            const [description, setDescription] = useState(product ? product.description : '');
+            const [categoryId, setCategoryId] = useState(product ? product.category_id : '');
+            const [images, setImages] = useState(product ? product.images : []);
+
+            const handleImageChange = async (e) => {
+                if (e.target.files && e.target.files.length > 0) {
+                    const files = Array.from(e.target.files);
+                    const base64Images = await Promise.all(files.map(file => fileToBase64(file)));
+                    setImages(prev => [...prev, ...base64Images]);
+                }
+            };
+
+            const removeImage = (indexToRemove) => {
+                setImages(prev => prev.filter((_, index) => index !== indexToRemove));
+            };
+
+            const handleSubmit = async (e) => {
+                e.preventDefault();
+                if (!name || !price || !categoryId || images.length === 0) {
+                    alert('يرجى ملء جميع الحقول ورفع صورة واحدة على الأقل.');
+                    return;
+                }
+                onSubmit({ ...product, name, price: parseFloat(price), description, category_id: parseInt(categoryId), images });
+            };
+
+            return (
+                 <form onSubmit={handleSubmit} className="space-y-4">
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                        <div>
+                            <label className="block text-sm font-medium text-slate-300 mb-1">اسم المنتج</label>
+                            <input type="text" value={name} onChange={e => setName(e.target.value)}
+                                className="w-full bg-white/10 border border-white/20 rounded-lg px-3 py-2 text-white focus:outline-none focus:ring-2 focus:ring-sky-500" required />
+                        </div>
+                        <div>
+                           <label className="block text-sm font-medium text-slate-300 mb-1">السعر</label>
+                           <input type="number" value={price} onChange={e => setPrice(e.target.value)}
+                                className="w-full bg-white/10 border border-white/20 rounded-lg px-3 py-2 text-white focus:outline-none focus:ring-2 focus:ring-sky-500" required />
+                        </div>
+                    </div>
+                    <div>
+                        <label className="block text-sm font-medium text-slate-300 mb-1">القسم</label>
+                        <select value={categoryId} onChange={e => setCategoryId(e.target.value)}
+                            className="w-full bg-white/10 border border-white/20 rounded-lg px-3 py-2 text-white focus:outline-none focus:ring-2 focus:ring-sky-500" required>
+                            <option value="">اختر قسم</option>
+                            {categories.map(cat => <option key={cat.id} value={cat.id}>{cat.name}</option>)}
+                        </select>
+                    </div>
+                    <div>
+                        <label className="block text-sm font-medium text-slate-300 mb-1">الوصف</label>
+                        <textarea value={description} onChange={e => setDescription(e.target.value)} rows="3"
+                             className="w-full bg-white/10 border border-white/20 rounded-lg px-3 py-2 text-white focus:outline-none focus:ring-2 focus:ring-sky-500"></textarea>
+                    </div>
+                     <div>
+                        <label className="block text-sm font-medium text-slate-300 mb-1">صور المنتج</label>
+                        <input type="file" multiple accept="image/*" onChange={handleImageChange}
+                             className="w-full text-sm text-slate-400 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-sky-50 file:text-sky-700 hover:file:bg-sky-100" />
+                        <div className="mt-4 flex flex-wrap gap-4">
+                            {images.map((img, index) => (
+                                <div key={index} className="relative">
+                                    <img src={img} className="h-24 w-24 object-cover rounded-lg" />
+                                    <button type="button" onClick={() => removeImage(index)} className="absolute top-0 right-0 bg-red-600 text-white rounded-full p-1 -mt-2 -mr-2">
+                                        <Icon path={ICONS.close} className="w-3 h-3"/>
+                                    </button>
+                                </div>
+                            ))}
+                        </div>
+                    </div>
+                    <div className="flex justify-end gap-4 pt-4">
+                        <Button onClick={onDone} variant="secondary">إلغاء</Button>
+                        <Button type="submit" variant="primary">
+                            {product ? 'تحديث المنتج' : 'إضافة منتج'}
+                        </Button>
+                    </div>
+                 </form>
+            );
+        };
+        
+        const ProductsTab = ({ products, setProducts, categories, showToast }) => {
+            const [isModalOpen, setIsModalOpen] = useState(false);
+            const [editingProduct, setEditingProduct] = useState(null);
+            const [filter, setFilter] = useState('');
+
+            const handleAddClick = () => {
+                setEditingProduct(null);
+                setIsModalOpen(true);
+            };
+
+            const handleEditClick = (product) => {
+                setEditingProduct(product);
+                setIsModalOpen(true);
+            };
+            
+            const handleDelete = async (id) => {
+                if (window.confirm('هل أنت متأكد من حذف هذا المنتج؟')) {
+                    try {
+                        await dataService.delete(STORES.PRODUCTS, id);
+                        setProducts(products.filter(p => p.id !== id));
+                        showToast('تم حذف المنتج بنجاح');
+                    } catch (error) {
+                        showToast('خطأ: ' + error.message);
+                    }
+                }
+            };
+
+            const handleSubmit = async (productData) => {
+                try {
+                    if (editingProduct) {
+                        const updated = await dataService.put(STORES.PRODUCTS, productData);
+                        setProducts(products.map(p => p.id === updated.id ? updated : p));
+                        showToast('تم تحديث المنتج بنجاح');
+                    } else {
+                         const { id, ...newData } = productData;
+                         const added = await dataService.add(STORES.PRODUCTS, newData);
+                         setProducts([...products, added]);
+                         showToast('تمت إضافة المنتج بنجاح');
+                    }
+                    setIsModalOpen(false);
+                } catch(error) {
+                    showToast('خطأ: ' + error.message);
+                }
+            };
+            
+            const getCategoryName = (id) => categories.find(c => c.id == id)?.name || 'غير معروف';
+            
+            const filteredProducts = products.filter(p => 
+                p.name.toLowerCase().includes(filter.toLowerCase()) ||
+                getCategoryName(p.category_id).toLowerCase().includes(filter.toLowerCase())
+            );
+
+            return (
+                 <div>
+                    <div className="flex flex-col md:flex-row justify-between items-center mb-6 gap-4">
+                        <h2 className="text-2xl font-bold">إدارة المنتجات</h2>
+                        <input
+                            type="text"
+                            placeholder="بحث عن منتج..."
+                            value={filter}
+                            onChange={(e) => setFilter(e.target.value)}
+                            className="bg-white/10 border border-white/20 rounded-lg px-4 py-2 text-white focus:outline-none focus:ring-2 focus:ring-sky-500 w-full md:w-auto"
+                        />
+                        <Button onClick={handleAddClick} className="w-full md:w-auto">
+                            <Icon path={ICONS.plus} />
+                            إضافة منتج جديد
+                        </Button>
+                    </div>
+                    <div className="glass-card rounded-lg overflow-hidden">
+                       <div className="overflow-x-auto">
+                        <table className="w-full text-right">
+                            <thead className="bg-white/10">
+                                <tr>
+                                    <th className="p-4 font-semibold">الصورة</th>
+                                    <th className="p-4 font-semibold">الاسم</th>
+                                    <th className="p-4 font-semibold">القسم</th>
+                                    <th className="p-4 font-semibold">السعر</th>
+                                    <th className="p-4 font-semibold">إجراءات</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {filteredProducts.map(prod => (
+                                    <tr key={prod.id} className="border-b border-white/10 hover:bg-white/5">
+                                        <td className="p-4"><img src={prod.images[0]} alt={prod.name} className="w-16 h-16 object-cover rounded-md" /></td>
+                                        <td className="p-4 font-medium">{prod.name}</td>
+                                        <td className="p-4 text-slate-300">{getCategoryName(prod.category_id)}</td>
+                                        <td className="p-4">{prod.price} ريال</td>
+                                        <td className="p-4">
+                                            <div className="flex gap-2">
+                                                <Button onClick={() => handleEditClick(prod)} variant="ghost" className="p-2"><Icon path={ICONS.edit} className="w-5 h-5" /></Button>
+                                                <Button onClick={() => handleDelete(prod.id)} variant="ghost" className="p-2 text-red-500"><Icon path={ICONS.trash} className="w-5 h-5" /></Button>
+                                            </div>
+                                        </td>
+                                    </tr>
+                                ))}
+                            </tbody>
+                        </table>
+                        </div>
+                    </div>
+                    <Modal isOpen={isModalOpen} onClose={() => setIsModalOpen(false)} title={editingProduct ? 'تعديل المنتج' : 'إضافة منتج جديد'}>
+                        <ProductForm onSubmit={handleSubmit} product={editingProduct} categories={categories} onDone={() => setIsModalOpen(false)} />
+                    </Modal>
+                </div>
+            );
+        };
+        
+        const SettingsTab = ({ settings, showToast }) => {
+            const [localSettings, setLocalSettings] = useState({});
+
+            useEffect(() => {
+                // Initialize local state from props
+                const initialSettings = {
+                    storeName: settings.storeName?.value || '',
+                    storeImage: settings.storeImage?.value || null,
+                    whatsappNumber: settings.whatsappNumber?.value || '',
+                    openRouterKey: settings.openRouterKey?.value || '',
+                    openRouterUrl: settings.openRouterUrl?.value || 'https://openrouter.ai/api/v1',
+                    cloudinaryKey: settings.cloudinaryKey?.value || '',
+                    cloudinarySecret: settings.cloudinarySecret?.value || '',
+                    cloudinaryCloudName: settings.cloudinaryCloudName?.value || '',
+                };
+                setLocalSettings(initialSettings);
+            }, [settings]);
+
+            const handleSettingChange = (key, value) => {
+                setLocalSettings(prev => ({ ...prev, [key]: value }));
+            };
+
+            const handleSaveSetting = async (key) => {
+                try {
+                    await dataService.setSetting(key, localSettings[key]);
+                    showToast(`تم حفظ "${key}" بنجاح`);
+                } catch (error) {
+                    showToast('خطأ: ' + error.message);
+                }
+            };
+            
+            const handleProfileImageChange = async (e) => {
+                if (e.target.files && e.target.files[0]) {
+                    const file = e.target.files[0];
+                    const base64Image = await fileToBase64(file);
+                    handleSettingChange('storeImage', base64Image);
+                }
+            };
+            
+            const handleTestConnection = (service) => {
+                // Placeholder for actual connection test logic
+                showToast(`جاري اختبار الاتصال بـ ${service}... (هذه مجرد محاكاة)`);
+                setTimeout(() => showToast(`تم الاتصال بـ ${service} بنجاح! (محاكاة)`), 2000);
+            };
+
+            const handleDeleteAllData = async () => {
+                if (window.confirm('تحذير! سيتم حذف جميع بيانات المتجر من قاعدة البيانات نهائياً. هل أنت متأكد؟')) {
+                    try {
+                        // This would need a backend function in Supabase for security.
+                        // For now, we simulate by clearing local and warning user.
+                        await indexedDBService.clearAllData();
+                        showToast('تم حذف البيانات المحلية. يجب حذف البيانات من Supabase يدوياً.');
+                        setTimeout(() => window.location.reload(), 2000);
+                    } catch (error) {
+                         showToast('خطأ: ' + error.message);
+                    }
+                }
+            };
+
+            return (
+                <div className="space-y-8">
+                    {/* Store Profile Settings */}
+                    <div className="glass-card p-6 rounded-lg">
+                        <h3 className="text-xl font-bold mb-4">إعدادات المتجر العامة</h3>
+                        <div className="space-y-4">
+                            <div>
+                                <label className="block text-sm font-medium text-slate-300 mb-1">اسم المتجر</label>
+                                <input type="text" value={localSettings.storeName || ''} onChange={e => handleSettingChange('storeName', e.target.value)} onBlur={() => handleSaveSetting('storeName')} placeholder="اكتب اسم متجرك هنا"
+                                    className="w-full bg-white/10 border border-white/20 rounded-lg px-3 py-2 text-white focus:outline-none focus:ring-2 focus:ring-sky-500" />
+                            </div>
+                            <div>
+                                <label className="block text-sm font-medium text-slate-300 mb-1">صورة بروفايل المتجر</label>
+                                <div className="flex items-center gap-4">
+                                    {localSettings.storeImage ? <img src={localSettings.storeImage} className="w-24 h-24 rounded-full object-cover border-2 border-white/30" alt="بروفايل المتجر"/> : <div className="w-24 h-24 rounded-full bg-white/10 flex items-center justify-center"><Icon path={ICONS.store} className="w-12 h-12 text-slate-400"/></div>}
+                                    <input type="file" id="profile-image" className="hidden" accept="image/*" onChange={handleProfileImageChange} />
+                                    <label htmlFor="profile-image" className="cursor-pointer px-4 py-2 rounded-lg font-semibold shadow-md transition-all duration-300 bg-slate-600 hover:bg-slate-700 text-white flex items-center justify-center gap-2">تغيير الصورة</label>
+                                    <Button onClick={() => handleSaveSetting('storeImage')}>حفظ الصورة</Button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    {/* Service Settings */}
+                     <div className="glass-card p-6 rounded-lg">
+                        <h3 className="text-xl font-bold mb-4">إعدادات الاتصال والخدمات</h3>
+                         <div className="space-y-6">
+                            {/* WhatsApp */}
+                            <div>
+                                <h4 className="font-bold text-lg text-sky-300 mb-2">WhatsApp</h4>
+                                <div className="flex items-center gap-2">
+                                    <input type="tel" value={localSettings.whatsappNumber || ''} onChange={e => handleSettingChange('whatsappNumber', e.target.value)} onBlur={() => handleSaveSetting('whatsappNumber')} placeholder="مثال: 966501234567"
+                                        className="flex-grow bg-white/10 border border-white/20 rounded-lg px-3 py-2 text-white focus:outline-none focus:ring-2 focus:ring-sky-500" />
+                                </div>
+                            </div>
+                            {/* OpenRouter.ai */}
+                            <div>
+                                <h4 className="font-bold text-lg text-sky-300 mb-2">OpenRouter.ai</h4>
+                                <div className="space-y-2">
+                                    <input type="text" value={localSettings.openRouterUrl || ''} onChange={e => handleSettingChange('openRouterUrl', e.target.value)} onBlur={() => handleSaveSetting('openRouterUrl')} placeholder="رابط API" className="w-full bg-white/10 border border-white/20 rounded-lg px-3 py-2 text-white" />
+                                    <input type="password" value={localSettings.openRouterKey || ''} onChange={e => handleSettingChange('openRouterKey', e.target.value)} onBlur={() => handleSaveSetting('openRouterKey')} placeholder="مفتاح API" className="w-full bg-white/10 border border-white/20 rounded-lg px-3 py-2 text-white" />
+                                    <Button onClick={() => handleTestConnection('OpenRouter')} variant="secondary" className="text-sm">اختبار الاتصال</Button>
+                                </div>
+                            </div>
+                            {/* Cloudinary */}
+                            <div>
+                                <h4 className="font-bold text-lg text-sky-300 mb-2">Cloudinary</h4>
+                                <div className="space-y-2">
+                                     <input type="text" value={localSettings.cloudinaryCloudName || ''} onChange={e => handleSettingChange('cloudinaryCloudName', e.target.value)} onBlur={() => handleSaveSetting('cloudinaryCloudName')} placeholder="Cloud Name" className="w-full bg-white/10 border border-white/20 rounded-lg px-3 py-2 text-white" />
+                                     <input type="text" value={localSettings.cloudinaryKey || ''} onChange={e => handleSettingChange('cloudinaryKey', e.target.value)} onBlur={() => handleSaveSetting('cloudinaryKey')} placeholder="API Key" className="w-full bg-white/10 border border-white/20 rounded-lg px-3 py-2 text-white" />
+                                     <input type="password" value={localSettings.cloudinarySecret || ''} onChange={e => handleSettingChange('cloudinarySecret', e.target.value)} onBlur={() => handleSaveSetting('cloudinarySecret')} placeholder="API Secret" className="w-full bg-white/10 border border-white/20 rounded-lg px-3 py-2 text-white" />
+                                    <Button onClick={() => handleTestConnection('Cloudinary')} variant="secondary" className="text-sm">اختبار الاتصال</Button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div className="glass-card p-6 rounded-lg border border-red-500/50">
+                        <h3 className="text-xl font-bold mb-4 text-red-400">منطقة الخطر</h3>
+                         <Button onClick={handleDeleteAllData} variant="danger" className="w-full">حذف جميع بيانات المتجر</Button>
+                    </div>
+                </div>
+            );
+        };
+        
+        const AdminScreen = ({ setView, appData, setAppData, showToast }) => {
+            const [activeTab, setActiveTab] = useState('dashboard');
+            const { categories, products, settings } = appData;
+
+            const handleLogout = async () => {
+                const { error } = await dataService.supabase.auth.signOut();
+                if (error) showToast('خطأ في تسجيل الخروج');
+            };
+
+            const TABS = {
+                dashboard: { label: 'لوحة التحكم', icon: ICONS.dashboard, component: <DashboardTab categories={categories} products={products} /> },
+                categories: { label: 'الأقسام', icon: ICONS.categories, component: <CategoriesTab categories={categories} setCategories={(newCats) => setAppData(d => ({...d, categories: newCats}))} showToast={showToast} /> },
+                products: { label: 'المنتجات', icon: ICONS.products, component: <ProductsTab products={products} setProducts={(newProds) => setAppData(d => ({...d, products: newProds}))} categories={categories} showToast={showToast} /> },
+                settings: { label: 'الإعدادات', icon: ICONS.settings, component: <SettingsTab settings={settings} showToast={showToast} /> }
+            };
+
+            return (
+                <div className="min-h-screen flex flex-col md:flex-row">
+                    <aside className="w-full md:w-64 bg-slate-900/50 p-4 md:p-6 flex-shrink-0">
+                         <div className="flex items-center justify-between mb-8">
+                            <div className="flex items-center gap-2">
+                                <Icon path={ICONS.manager} className="w-8 h-8 text-sky-400" />
+                                <h1 className="text-2xl font-bold">مدير المتجر</h1>
+                            </div>
+                         </div>
+                        <nav className="flex flex-row md:flex-col md:space-y-2 overflow-x-auto pb-2 md:pb-0">
+                            {Object.entries(TABS).map(([key, { label, icon }]) => (
+                                <button key={key} onClick={() => setActiveTab(key)} className={`flex items-center gap-3 p-3 rounded-lg text-lg whitespace-nowrap ${activeTab === key ? 'bg-sky-500 text-white' : 'hover:bg-white/10'}`}>
+                                    <Icon path={icon} />
+                                    <span>{label}</span>
+                                </button>
+                            ))}
+                        </nav>
+                         <div className="mt-auto pt-6 flex flex-col gap-2">
+                            <Button onClick={() => setView('shopper')} variant="secondary" className="w-full">
+                                <Icon path={ICONS.back} className="w-5 h-5" /> العودة للمتجر
+                            </Button>
+                             <Button onClick={handleLogout} variant="danger" className="w-full">
+                                <Icon path={ICONS.logout} className="w-5 h-5" /> تسجيل الخروج
+                            </Button>
+                        </div>
+                    </aside>
+                    <main className="flex-1 p-4 md:p-8 overflow-y-auto custom-scrollbar">
+                        {TABS[activeTab].component}
+                    </main>
+                </div>
+            );
+        };
+        
+        // --- SHOPPER COMPONENTS (largely unchanged, but adapted for new data structure) ---
+        const ProductDetailModal = ({ product, onClose, onAddItems }) => {
+            const [selectedIndices, setSelectedIndices] = useState([]);
+            if (!product) return null;
+            const toggleSelection = (index) => {
+                setSelectedIndices(prev => prev.includes(index) ? prev.filter(i => i !== index) : [...prev, index]);
+            };
+            const handleAddToCart = () => {
+                if (selectedIndices.length > 0) {
+                    onAddItems(product, selectedIndices);
+                    onClose();
+                }
+            };
+            return (
+                <Modal isOpen={true} onClose={onClose} title={`اختر من: ${product.name}`}>
+                    <div className="space-y-4">
+                        <p className="text-slate-300">{product.description}</p>
+                        <p className="text-2xl font-bold text-sky-400">{product.price} <span className="text-sm">ريال</span></p>
+                        <h4 className="font-semibold text-lg">الأشكال المتوفرة:</h4>
+                        <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-4">
+                            {product.images.map((image, index) => (
+                                <div key={index} className={`relative rounded-lg overflow-hidden cursor-pointer border-4 ${selectedIndices.includes(index) ? 'border-sky-500' : 'border-transparent'}`} onClick={() => toggleSelection(index)}>
+                                    <img src={image} alt={`${product.name} variation ${index + 1}`} className="w-full h-32 object-cover" />
+                                    {selectedIndices.includes(index) && (<div className="absolute inset-0 bg-sky-500/50 flex items-center justify-center"><svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={3} stroke="currentColor" className="w-8 h-8 text-white"><path strokeLinecap="round" strokeLinejoin="round" d="M4.5 12.75l6 6 9-13.5" /></svg></div>)}
+                                </div>
+                            ))}
+                        </div>
+                        <div className="flex justify-end gap-4 pt-4">
+                            <Button onClick={onClose} variant="secondary">إلغاء</Button>
+                            <Button onClick={handleAddToCart} variant="primary" disabled={selectedIndices.length === 0}>إضافة {selectedIndices.length > 0 ? `(${selectedIndices.length})` : ''} للسلة</Button>
+                        </div>
+                    </div>
+                </Modal>
+            );
+        };
+
+        const ProductCard = ({ product, onProductSelect }) => {
+            const [currentImageIndex, setCurrentImageIndex] = useState(0);
+            const nextImage = (e) => { e.stopPropagation(); if (!product.images || product.images.length === 0) return; setCurrentImageIndex(prev => (prev + 1) % product.images.length); };
+            const prevImage = (e) => { e.stopPropagation(); if (!product.images || product.images.length === 0) return; setCurrentImageIndex(prev => (prev - 1 + product.images.length) % product.images.length); };
+            return (
+                <div className="glass-card rounded-lg overflow-hidden flex flex-col group cursor-pointer transition-transform transform hover:scale-105" onClick={() => onProductSelect(product)}>
+                    <div className="relative">
+                        {product.images && product.images.length > 0 ? (<img src={product.images[currentImageIndex]} alt={product.name} className="w-full h-48 object-cover"/>) : (<div className="w-full h-48 bg-slate-800 flex items-center justify-center"><Icon path={ICONS.products} className="w-16 h-16 text-slate-500" /></div>)}
+                        {product.images && product.images.length > 1 && (
+                            <>
+                                <button onClick={prevImage} className="absolute left-2 top-1/2 -translate-y-1/2 bg-black/40 text-white p-1.5 rounded-full opacity-0 group-hover:opacity-100 transition-opacity focus:opacity-100 focus:outline-none focus:ring-2 focus:ring-sky-500"><svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={2.5} stroke="currentColor" className="w-5 h-5"><path strokeLinecap="round" strokeLinejoin="round" d="M15.75 19.5L8.25 12l7.5-7.5" /></svg></button>
+                                <button onClick={nextImage} className="absolute right-2 top-1/2 -translate-y-1/2 bg-black/40 text-white p-1.5 rounded-full opacity-0 group-hover:opacity-100 transition-opacity focus:opacity-100 focus:outline-none focus:ring-2 focus:ring-sky-500"><svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={2.5} stroke="currentColor" className="w-5 h-5"><path strokeLinecap="round" strokeLinejoin="round" d="M8.25 4.5l7.5 7.5-7.5 7.5" /></svg></button>
+                                <div className="absolute bottom-2 left-1/2 -translate-x-1/2 flex gap-1.5">{product.images.map((_, index) => (<div key={index} className={`w-2 h-2 rounded-full transition-colors ${index === currentImageIndex ? 'bg-white' : 'bg-white/50'}`}></div>))}</div>
+                            </>
+                        )}
+                    </div>
+                    <div className="p-4 flex flex-col flex-grow">
+                        <h3 className="font-bold text-xl">{product.name}</h3>
+                        <p className="text-slate-300 mt-1 flex-grow">{product.description || ' '}</p>
+                        <div className="flex justify-between items-center mt-4">
+                            <span className="text-2xl font-bold text-sky-400">{product.price} <span className="text-sm">ريال</span></span>
+                        </div>
+                    </div>
+                </div>
+            );
+        };
+
+        const ShopperScreen = ({ setView, appData }) => {
+            const { categories, products, settings } = appData;
+            const [selectedCategory, setSelectedCategory] = useState(null);
+            const [cart, setCart] = useState([]);
+            const [viewingProduct, setViewingProduct] = useState(null);
+            const [priceSort, setPriceSort] = useState('default');
+            
+            const storeName = settings.storeName?.value || 'المتجر';
+            const storeImage = settings.storeImage?.value || null;
+            const whatsappNumber = settings.whatsappNumber?.value || '';
+
+            const addVariationsToCart = (product, selectedIndices) => {
+                setCart(prevCart => {
+                    const newCart = [...prevCart];
+                    selectedIndices.forEach(index => {
+                        const cartItemId = `${product.id}_${index}`;
+                        const existingItemIndex = newCart.findIndex(item => item.cartItemId === cartItemId);
+                        if (existingItemIndex > -1) {
+                             newCart[existingItemIndex] = {...newCart[existingItemIndex], quantity: newCart[existingItemIndex].quantity + 1};
+                        } else {
+                            newCart.push({...product, quantity: 1, selectedImageIndex: index, cartItemId: cartItemId});
+                        }
+                    });
+                    return newCart;
+                });
+            };
+
+            const filteredProducts = useMemo(() => {
+                if (!selectedCategory) return [];
+                const categoryProducts = products.filter(p => p.category_id == selectedCategory.id);
+                switch (priceSort) {
+                    case 'low-to-high': return [...categoryProducts].sort((a, b) => a.price - b.price);
+                    case 'high-to-low': return [...categoryProducts].sort((a, b) => b.price - a.price);
+                    default: return categoryProducts;
+                }
+            }, [selectedCategory, products, priceSort]);
+
+            const totalItems = cart.reduce((sum, item) => sum + item.quantity, 0);
+            const total = cart.reduce((sum, item) => sum + item.price * item.quantity, 0).toFixed(2);
+
+            const handleSendOrder = () => {
+                if (!whatsappNumber) {
+                    alert('عفواً، رقم التواصل غير محدد من قبل مدير المتجر.');
+                    return;
+                }
+                let message = `*طلب جديد من متجر: ${storeName}*\n\n----------------------------------\nتفاصيل الطلب:\n\n`;
+                cart.forEach(item => {
+                    message += `- ${item.name} (الشكل رقم ${item.selectedImageIndex + 1}) (الكمية: ${item.quantity}) - ${item.price} ريال\n`;
+                });
+                message += `\n*الإجمالي: ${total} ريال*`;
+                window.open(`https://wa.me/${whatsappNumber}?text=${encodeURIComponent(message)}`, '_blank');
+            };
+
+            return (
+                <div className="min-h-screen p-4 md:p-8 relative pb-32">
+                     <header className="flex justify-between items-start pt-4 mb-8">
+                        <div className="w-14"></div>
+                        <div className="flex flex-col items-center gap-2">
+                             {storeImage ? <img src={storeImage} alt={`${storeName} logo`} className="w-20 h-20 rounded-full object-cover border-2 border-white/30" /> : <div className="w-20 h-20 rounded-full bg-white/10 flex items-center justify-center"><Icon path={ICONS.store} className="w-10 h-10 text-sky-400" /></div>}
+                            <h1 className="text-2xl font-bold">{storeName}</h1>
+                        </div>
+                        <div className="w-14 flex justify-end">
+                            <Button onClick={() => setView('admin')} variant="ghost" className="p-2"><Icon path={ICONS.manager} className="w-8 h-8" /></Button>
+                        </div>
+                    </header>
+                    
+                    {!selectedCategory ? (
+                        <div>
+                            <h2 className="text-2xl font-semibold mb-4">الأقسام</h2>
+                            <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-6">
+                                {categories.map(cat => (
+                                    <div key={cat.id} onClick={() => setSelectedCategory(cat)} className="glass-card rounded-lg overflow-hidden group cursor-pointer transition-transform transform hover:scale-105">
+                                        <img src={cat.image} alt={cat.name} className="w-full h-40 object-cover" />
+                                        <div className="p-4"><h3 className="font-bold text-lg text-center">{cat.name}</h3></div>
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+                    ) : (
+                         <div>
+                            <div className="flex items-center gap-4 mb-6">
+                                <Button onClick={() => { setSelectedCategory(null); setPriceSort('default'); }} variant="ghost" className="p-2"><Icon path={ICONS.back} /></Button>
+                                <h2 className="text-2xl font-semibold">{selectedCategory.name}</h2>
+                            </div>
+                            <div className="mb-6 glass-card p-3 rounded-lg flex items-center justify-between flex-wrap gap-2">
+                                <span className="font-semibold text-slate-300">ترتيب حسب:</span>
+                                <select value={priceSort} onChange={(e) => setPriceSort(e.target.value)} className="bg-white/10 border border-white/20 rounded-lg px-3 py-1.5 text-white focus:outline-none focus:ring-2 focus:ring-sky-500">
+                                    <option value="default">افتراضي</option>
+                                    <option value="low-to-high">السعر: من الأقل للأعلى</option>
+                                    <option value="high-to-low">السعر: من الأعلى للأقل</option>
+                                </select>
+                            </div>
+                             <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-6">
+                                {filteredProducts.map(prod => <ProductCard key={prod.id} product={prod} onProductSelect={setViewingProduct} />)}
+                            </div>
+                         </div>
+                    )}
+                    {viewingProduct && <ProductDetailModal product={viewingProduct} onClose={() => setViewingProduct(null)} onAddItems={addVariationsToCart}/>}
+                    {cart.length > 0 && (
+                        <div className="fixed bottom-4 right-4 left-4 glass-card rounded-xl p-4 shadow-2xl flex flex-col md:flex-row justify-between items-center gap-4">
+                           <div>
+                            <h3 className="text-xl font-bold">السلة ({totalItems} عناصر)</h3>
+                            <p className="text-2xl font-bold">الإجمالي: {total} ريال</p>
+                           </div>
+                           <Button onClick={handleSendOrder} className="w-full md:w-auto bg-green-500 hover:bg-green-600 focus:ring-green-500"><Icon path={ICONS.whatsapp} className="w-6 h-6"/> إرسال الطلب عبر واتساب</Button>
+                        </div>
+                    )}
+                </div>
+            );
+        };
+        
+        // --- APP COMPONENT (Main Orchestrator) ---
+        const App = () => {
+            const [view, setView] = useState('shopper'); // 'admin', 'shopper'
+            const [appStatus, setAppStatus] = useState('INITIALIZING'); // INITIALIZING, NEEDS_CONFIG, NEEDS_AUTH, READY, ERROR
+            const [session, setSession] = useState(null);
+            const [appData, setAppData] = useState({ categories: [], products: [], settings: {} });
+            const [toast, setToast] = useState({ show: false, message: '' });
+            const showToast = (message) => setToast({ show: true, message });
+            
+            const verifySupabaseConnection = async () => {
+                const configStr = localStorage.getItem('supabaseConfig');
+                if (!configStr) {
+                    console.log("No Supabase config found. Proceeding to setup screen.");
+                    return null;
+                }
+
+                try {
+                    if (typeof window.supabase?.createClient !== 'function') {
+                        console.error("Supabase client library not loaded.");
+                        return null;
+                    }
+
+                    const config = JSON.parse(configStr);
+                    if (!config || !config.url || !config.anonKey) {
+                        console.error("Invalid Supabase config format in localStorage.");
+                        localStorage.removeItem('supabaseConfig');
+                        return null;
+                    }
+
+                    const client = window.supabase.createClient(config.url, config.anonKey);
+                    
+                    const { error } = await client.from('settings').select('key', { head: true });
+                    if (error) {
+                        throw error;
+                    }
+                    
+                    console.log("Supabase connection verified successfully.");
+                    return client;
+
+                } catch (error) {
+                    console.error("Failed to verify stored Supabase credentials:", error.message);
+                    localStorage.removeItem('supabaseConfig');
+                    return null;
+                }
+            };
+
+            useEffect(() => {
+                let isMounted = true;
+                let authSubscription = null;
+                
+                const initializeApp = async () => {
+                    try {
+                        setAppStatus('INITIALIZING');
+                        await indexedDBService.initDB();
+                        
+                        const configExistsBeforeVerification = !!localStorage.getItem('supabaseConfig');
+                        const supabaseClient = await verifySupabaseConnection();
+                        
+                        if (!isMounted) return;
+                        
+                        if (supabaseClient) {
+                            dataService.init(supabaseClient);
+                            
+                            const { data: { session: initialSession } } = await supabaseClient.auth.getSession();
+                            if (!isMounted) return;
+                            
+                            setSession(initialSession);
+                            
+                            const defaultData = { categories: [], products: [], settings: {} };
+                            const data = initialSession 
+                                ? await dataService.syncAllDataFromSupabase() 
+                                : await dataService.getAllLocalData();
+                            if (isMounted) {
+                               setAppData(data || defaultData);
+                            }
+                            
+                            if (isMounted) {
+                                setAppStatus(initialSession ? 'READY' : 'NEEDS_AUTH');
+                            }
+                            
+                            const { data: { subscription } } = supabaseClient.auth.onAuthStateChange(async (_event, newSession) => {
+                                 if (!isMounted) return;
+                                 const sessionChanged = JSON.stringify(session) !== JSON.stringify(newSession);
+                                 setSession(newSession);
+                                 
+                                 if (sessionChanged) {
+                                    if (newSession) {
+                                        setAppStatus('READY');
+                                        const freshData = await dataService.syncAllDataFromSupabase();
+                                        if(isMounted) setAppData(freshData || defaultData);
+                                    } else {
+                                        setAppStatus('NEEDS_AUTH');
+                                        await indexedDBService.clearAllData();
+                                        if(isMounted) setAppData(defaultData);
+                                    }
+                                 }
+                            });
+                            authSubscription = subscription;
+                        } else {
+                            setAppStatus('NEEDS_CONFIG');
+                            dataService.init(null);
+                            if (configExistsBeforeVerification) {
+                                setTimeout(() => showToast('فشل التحقق من الإعدادات المحفوظة. يرجى إدخالها مجدداً.'), 100);
+                            }
+                        }
+                    } catch (error) {
+                        console.error("Critical initialization failure:", error);
+                        if (isMounted) {
+                            setAppStatus('ERROR');
+                        }
+                    }
+                };
+
+                initializeApp();
+
+                return () => {
+                    isMounted = false;
+                    if (authSubscription) {
+                        authSubscription.unsubscribe();
+                        console.log("Auth listener unsubscribed.");
+                    }
+                };
+            }, []);
+
+            const handleConfigSave = (config) => {
+                try {
+                    localStorage.setItem('supabaseConfig', JSON.stringify(config));
+                    window.location.reload();
+                } catch(e) {
+                    console.error("Failed to save config to localStorage", e);
+                    showToast('فشل حفظ الإعدادات. قد تكون مساحة التخزين ممتلئة.');
+                }
+            };
+            
+            const renderContent = () => {
+                switch (appStatus) {
+                    case 'INITIALIZING':
+                        return <FullScreenSpinner message="جاري التحميل والتحقق..." />;
+                    case 'NEEDS_CONFIG':
+                        return <SupabaseSetupScreen onSave={handleConfigSave} />;
+                    case 'NEEDS_AUTH':
+                        return <LoginScreen />;
+                    case 'READY':
+                         const CurrentView = view === 'admin' && session ? AdminScreen : ShopperScreen;
+                         return <CurrentView setView={setView} appData={appData} setAppData={setAppData} showToast={showToast} />;
+                    case 'ERROR':
+                        return (
+                            <div className="min-h-screen flex flex-col justify-center items-center text-center p-4">
+                                <Icon path={ICONS.database} className="w-16 h-16 mx-auto text-red-400 mb-4" />
+                                <h1 className="text-3xl font-bold text-red-400">فشل حاسم في بدء التشغيل</h1>
+                                <p className="mt-2 text-slate-300 max-w-md">
+                                    لم يتمكن التطبيق من البدء. قد يكون هذا بسبب أن المتصفح لا يدعم التخزين المحلي (IndexedDB)، أو أنك تستخدم وضع التصفح الخفي الذي يمنع الوصول إليه.
+                                </p>
+                                <p className="mt-4 text-sm text-slate-400">
+                                    يرجى محاولة تحديث الصفحة، أو استخدام متصفح آخر (مثل Chrome أو Firefox)، أو التأكد من أنك لست في وضع التصفح الخفي.
+                                </p>
+                            </div>
+                        );
+                    default:
+                        return <FullScreenSpinner message="حالة غير معروفة، يرجى تحديث الصفحة." />;
+                }
+            };
+
+            return (
+                <>
+                    {renderContent()}
+                    <Toast message={toast.message} show={toast.show} onDismiss={() => setToast({ show: false, message: '' })} />
+                </>
+            );
+        };
+
+        // --- RENDER THE APP ---
+        const container = document.getElementById('root');
+        const root = ReactDOM.createRoot(container);
+        root.render(<App />);
+
+    </script>
+</body>
+</html>
